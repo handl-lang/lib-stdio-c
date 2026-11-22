@@ -1,0 +1,10 @@
+-- lib-stdio-c: package manifest.
+{
+  deps: { grade: "branch:main", stdio: "branch:main" },
+  modules: ["stdio-c"],
+  name: "stdio-c",
+  description: "C backend for the stdio contract — buffered stdin/stdout/stderr over libc via ffi.call.",
+  license: "MIT",
+  keywords: ["stdio", "stdin", "stdout", "stderr", "libc", "ffi", "backend"],
+  homepage: "https://github.com/handl-lang/lib-stdio-c",
+}

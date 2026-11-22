@@ -1,0 +1,30 @@
+--- stdio-c tests: only the paths that never reach a real stream are
+--- exercised — argument validation raises before any `ffi.call`, and
+--- `read_chars(0)` returns empty Bytes without touching stdin.
+--- `flush` is a real `fflush(NULL)` smoke (harmless: it writes nothing
+--- pending). Actual stdout/stdin behavior cannot be asserted inside
+--- the gate — that needs a pty/pipe harness, which does not exist yet.
+
+from "./index" import * as m
+from "bytes" import * as bytesm
+
+res_tag :: r ~> match r { ok(_): "ok", err(_): "err", _: "?" }
+
+test_write_rejects_number :: assert res_tag(
+  error.try((x) ~> m.write(123))) = "err"
+
+test_ewrite_rejects_record :: assert res_tag(
+  error.try((x) ~> m.ewrite({ a: 1 }))) = "err"
+
+test_print_rejects_number :: assert res_tag(
+  error.try((x) ~> m.print(42))) = "err"
+
+test_eprint_rejects_null :: assert res_tag(
+  error.try((x) ~> m.eprint(null))) = "err"
+
+test_read_chars_negative :: assert res_tag(
+  error.try((x) ~> m.read_chars(-1))) = "err"
+
+test_read_chars_zero_is_empty :: assert bytesm.to_list(m.read_chars(0)) = []
+
+test_flush_returns_null :: assert m.flush() = null

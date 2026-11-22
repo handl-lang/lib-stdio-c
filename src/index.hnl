@@ -1,0 +1,281 @@
+--- stdio-c -- the libc backend for the `stdio` contract.
+---
+--- Buffered standard-stream I/O over `ffi.call("libc.so.6", ...)`
+--- directly on the `stdin`/`stdout`/`stderr` FILE* objects — no posix
+--- dep, no generated libc adapter, no shell.
+---
+--- Why the buffering lives in libc: handl values are immutable (there
+--- is no ref/cell/mutable-state primitive — state is explicit data per
+--- ADR-0106), so a handl-side accumulator could not persist between
+--- calls anyway, and `bytes.concat` accumulation would be quadratic.
+--- libc stdio IS the contract's documented model: `stdout` is
+--- line-buffered on a terminal and block-buffered (~4-8 KiB) otherwise,
+--- `stderr` is unbuffered, `stdin` reads ahead — and N `print`s cost
+--- ~one `write(2)`. Every export resolves the FILE* globals fresh
+--- (`ffi.sym` for the variable's address, `ffi.read` to dereference
+--- the stored pointer) and lets libc own the buffer.
+---
+--- Surface mapping:
+---   print/eprint  -> `s + "\n"` utf8-encoded, one `fwrite` each
+---   write/ewrite   -> String|Bytes verbatim through `fwrite`
+---   flush          -> `fflush(NULL)` — every output stream at once
+---   read_line      -> `getline` (arbitrary length; libc keeps any
+---                     partial line buffered for the next call)
+---   read_chars/all -> `fread(ptr, 1, want, stdin)` loop in 64 KiB
+---                     `out_ptr` slots, sliced to the byte count
+---
+--- Errors raise `stdio: <op>: <strerror>` — `-1`/NULL/0 never escape.
+--- EINTR is retried, matching the fs.hnl convention.
+---
+--- Platform: linux x86_64 glibc (`libc.so.6`).
+---
+--- `ffi`, `type`, `error`, `hash_map` are host modules on the stdlib
+--- chain — reached by qualified call with no import line (the
+--- intl-c/cli-c convention). `str`/`bytes` are stdlib modules.
+
+from "str" import * as strm
+from "bytes" import * as bytesm
+
+LIBC := "libc.so.6"
+
+--- fread chunk ceiling — one `out_ptr` slot per call.
+CHUNK := 65536
+
+--- errno retried rather than raised.
+EINTR := 4
+
+--- `strerror(errno)` — the C message for an errno value, or a bare
+--- "errno <n>" when strerror returns NULL.
+strerror := (n) ~> do {
+  s := ffi.call(LIBC, "strerror", [n], ["i32"], "cstr", false)
+  if s == null { "errno " + type.to_string(n) } else { s }
+}
+
+--- Resolve a libc global data symbol and read the pointer it stores.
+--- `stdin`/`stdout`/`stderr` are `FILE *` globals: `ffi.sym` yields the
+--- variable's address, `ffi.read` dereferences it to the FILE* value.
+file_stream := (name) ~> do {
+  r := ffi.sym(LIBC, name)
+  if hash_map.get_or(r, "__tag__", "") != "ok" {
+    error.raise("stdio: " + name + ": "
+      + type.to_string(hash_map.get_or(r, "value", "")))
+  } else {
+    ffi.read(hash_map.get_or(r, "value", 0), "ptr")
+  }
+}
+
+--- Encode `data` (String or Bytes) and `fwrite` it to the FILE* behind
+--- `stream_name`. `in_buf` expands the Bytes to C's (ptr, len) pair, so
+--- the call marshals as `fwrite(ptr, len, 1, stream)` — libc buffers
+--- the bytes and loops internally on short writes; a 0 return means
+--- the stream's error indicator is set.
+emit := (what, stream_name, data) ~> do {
+  b := if type.of(data) == "string" {
+    bytesm.utf8_encode(data)
+  } else if type.of(data) == "bytes" {
+    data
+  } else {
+    error.raise("stdio: " + what + ": data must be String or Bytes")
+  }
+  if bytesm.len(b) == 0 {
+    null
+  } else {
+    do {
+      stream := file_stream(stream_name)
+      r := ffi.call(LIBC, "fwrite", [b, 1, stream],
+        ["in_buf", "i64", "ptr"], "i64", false)
+      if r != 1 {
+        do {
+          e := ffi.errno()
+          if e == 0 {
+            error.raise("stdio: " + what + ": write error")
+          } else {
+            error.raise("stdio: " + what + ": " + strerror(e))
+          }
+        }
+      } else {
+        null
+      }
+    }
+  }
+}
+
+--- Decode a little-endian userspace pointer (<= 48 bits) from an
+--- 8-byte out slot — the `char *` getline writes through its first
+--- out-pointer lands in the low six bytes on x86_64.
+le_ptr := (b) ~> bytesm.at(b, 0)
+  + bytesm.at(b, 1) * 256
+  + bytesm.at(b, 2) * 65536
+  + bytesm.at(b, 3) * 16777216
+  + bytesm.at(b, 4) * 4294967296
+  + bytesm.at(b, 5) * 1099511627776
+
+--- `fread(ptr, 1, want, stdin)` loop. `out_ptr:65536` allocates the
+--- slot and hands C the bare pointer; size-1 items make fread's return
+--- a byte count, and `buf` (always the full slot) slices to it. `limit`
+--- < 0 reads to EOF; otherwise stops after `limit` bytes — fread only
+--- returns short at end-of-file or error, so a short read is followed
+--- by one more call that reports 0. EOF vs error is decided by
+--- `ferror(stdin)`; EINTR retries. Result `{ data, bad }`: `bad` is 0
+--- on clean EOF/limit, -1 on error with errno unset, else the errno.
+read_go := (limit) ~> while { acc: bytesm.from_list([]), left: limit } {
+  (acc, left) ~>
+    if left == 0 {
+      { out: { data: acc, bad: 0 } }
+    } else {
+      do {
+        want := if left > 0 && left < CHUNK { left } else { CHUNK }
+        stream := file_stream("stdin")
+        r := ffi.call(LIBC, "fread", [1, want, stream],
+          ["out_ptr:65536", "i64", "i64", "ptr"], "i64", false)
+        if r.ret > 0 {
+          { state: { acc: bytesm.concat(acc, bytesm.slice(r.buf, 0, r.ret)),
+                     left: if left > 0 { left - r.ret } else { left } } }
+        } else {
+          do {
+            fe := ffi.call(LIBC, "ferror", [stream], ["ptr"], "i32", false)
+            e := ffi.errno()
+            if fe == 0 {
+              { out: { data: acc, bad: 0 } }
+            } else if e == EINTR {
+              { state: { acc: acc, left: left } }
+            } else {
+              { out: { data: acc, bad: if e == 0 { -1 } else { e } } }
+            }
+          }
+        }
+      }
+    }
+}
+
+--- The `getline` retry loop: `{ data, bad }` where `data` is the line
+--- String (newline stripped) or null at EOF, `bad` the errno-style
+--- code (-1 = error with errno unset). `out_ptr:8` twice gives C the
+--- `char **lineptr` / `size_t *n` pair; getline mallocs the buffer, we
+--- cstr-read it back through `ffi.read`, then `free` it.
+line_go := () ~> while { go: true } {
+  (go) ~> do {
+    stream := file_stream("stdin")
+    g := ffi.call(LIBC, "getline", [stream],
+      ["out_ptr:8", "out_ptr:8", "ptr"], "i64", false)
+    if g.ret <= 0 {
+      do {
+        fe := ffi.call(LIBC, "ferror", [stream], ["ptr"], "i32", false)
+        e := ffi.errno()
+        if fe == 0 {
+          { out: { data: null, bad: 0 } }
+        } else if e == EINTR {
+          { state: { go: true } }
+        } else {
+          { out: { data: null, bad: if e == 0 { -1 } else { e } } }
+        }
+      }
+    } else {
+      do {
+        addr := le_ptr(g.outs[0])
+        raw := error.try((x) ~> ffi.read(addr, "cstr"))
+        _ := ffi.call(LIBC, "free", [addr], ["ptr"], "void", false)
+        s := match raw {
+          ok(v): v,
+          _: error.raise("stdio: read_line: input is not valid UTF-8")
+        }
+        line := if strm.ends_with(s, "\n") {
+          strm.slice(s, 0, strm.length(s) - 1)
+        } else {
+          s
+        }
+        { out: { data: line, bad: 0 } }
+      }
+    }
+  }
+}
+
+-- ---------------------------------------------------------------------------
+-- Contract surface (untyped exports — the *-c convention: a type
+-- annotation is treated as a callee and fails for imported arrow
+-- types; see cli-c/intl-c).
+-- ---------------------------------------------------------------------------
+
+--- print(s): `s` + newline to stdout.
+export print := (s) ~> do {
+  if type.of(s) != "string" {
+    error.raise("stdio: print: argument must be a String")
+  } else {
+    emit("print", "stdout", s + "\n")
+  }
+}
+
+--- eprint(s): `s` + newline to stderr.
+export eprint := (s) ~> do {
+  if type.of(s) != "string" {
+    error.raise("stdio: eprint: argument must be a String")
+  } else {
+    emit("eprint", "stderr", s + "\n")
+  }
+}
+
+--- write(data): raw stdout — String (UTF-8) or Bytes, no newline.
+export write := (data) ~> emit("write", "stdout", data)
+
+--- ewrite(data): raw stderr — String or Bytes.
+export ewrite := (data) ~> emit("ewrite", "stderr", data)
+
+--- flush(): fflush(NULL) — every pending output stream at once.
+export flush := () ~> do {
+  r := ffi.call(LIBC, "fflush", [0], ["ptr"], "i32", false)
+  if r != 0 {
+    do {
+      e := ffi.errno()
+      if e == 0 {
+        error.raise("stdio: flush: write error")
+      } else {
+        error.raise("stdio: flush: " + strerror(e))
+      }
+    }
+  } else {
+    null
+  }
+}
+
+--- read_line(): next stdin line without the trailing newline, or null
+--- at EOF. Blocks to '\n'; a final unterminated line still returns.
+export read_line := () ~> do {
+  r := line_go()
+  if r.bad == 0 {
+    r.data
+  } else if r.bad < 0 {
+    error.raise("stdio: read_line: read error")
+  } else {
+    error.raise("stdio: read_line: " + strerror(r.bad))
+  }
+}
+
+--- read_chars(n): up to `n` bytes from stdin as Bytes (short at EOF).
+export read_chars := (n) ~> do {
+  if n < 0 {
+    error.raise("stdio: read_chars: negative count")
+  } else {
+    do {
+      r := read_go(n)
+      if r.bad == 0 {
+        r.data
+      } else if r.bad < 0 {
+        error.raise("stdio: read_chars: read error")
+      } else {
+        error.raise("stdio: read_chars: " + strerror(r.bad))
+      }
+    }
+  }
+}
+
+--- read_all(): drain stdin to EOF as Bytes.
+export read_all := () ~> do {
+  r := read_go(-1)
+  if r.bad == 0 {
+    r.data
+  } else if r.bad < 0 {
+    error.raise("stdio: read_all: read error")
+  } else {
+    error.raise("stdio: read_all: " + strerror(r.bad))
+  }
+}
