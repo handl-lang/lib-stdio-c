@@ -1,6 +1,6 @@
 -- lib-stdio-c: package manifest.
 {
-  deps: { grade: "branch:main", stdio: "branch:main" },
+  deps: { stdio: "branch:main" },
   modules: ["stdio-c"],
   name: "stdio-c",
   description: "C backend for the stdio contract — buffered stdin/stdout/stderr over libc via ffi.call.",
