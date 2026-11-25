@@ -35,7 +35,7 @@ arrow types). Errors raise `stdio: <op>: <strerror>`.
 ```text
 src/             the .hnl sources (index + tests)
 pkg.hnl          package manifest — modules, deps, description, license
-ci.sh            bupha entry → scripts/hnl-gate.sh
+workflows/gate.yaml            bupha entry (handl-gates) → scripts/hnl-gate.sh
 ```
 
 ## Gate
